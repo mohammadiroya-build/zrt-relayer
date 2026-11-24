@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "network": "testnet",
+  "generatedAt": "2026-11-24T14:14:17.100Z",
+  "route": {
+    "tokenId": "0xd29350d118a457eb3698b6aeb455806ad90be0d933b94cf9499bfd817d11b7dc",
+    "symbol": "ZRT",
+    "decimals": 18,
+    "timeoutSeconds": 3600
+  },
+  "chains": {
+    "zenith": {
+      "key": "zenith",
+      "name": "Zenith EVM Testnet",
+      "chainId": 936485,
+      "domain": 936485,
+      "rpcUrl": "https://rpc.testnet.zenith.network/",
+      "explorer": "https://explorer.testnet.zenith.network",
+      "nativeSymbol": "ZTH",
+      "nativeName": "Zenith gas token",
+      "confirmations": 1,
+      "token": {
+        "address": "0x8A05A15aACf6E1009B0D574e995e954f1373f340",
+        "symbol": "ZRT",
+        "decimals": 18
+      },
+      "bridge": "0x5190339F59B88B033389059daf7841f52F0e10b4"
+    },
+    "sepolia": {
+      "key": "sepolia",
+      "name": "Ethereum Sepolia",
+      "chainId": 11155111,
+      "domain": 11155111,
+      "rpcUrl": "https://ethereum-sepolia-rpc.publicnode.com",
+      "explorer": "https://sepolia.etherscan.io",
+      "nativeSymbol": "ETH",
+      "nativeName": "Sepolia ether",
+      "confirmations": 1,
+      "token": {
+        "address": "0xe57AEA293F0E88806Be9542b05E18E8EFB85ee38",
+        "symbol": "ZRT",
+        "decimals": 18
+      },
+      "bridge": "0xD3D9C324B55eC6dF066b11C5002eadEAD0cC354a"
+    }
+  },
+  "defaultRoute": {
+    "from": "zenith",
+    "to": "sepolia"
+  },
+  "relayer": {
+    "url": "",
+    "healthPath": "/health"
+  },
+  "faucet": {
+    "enabled": true,
+    "amount": "1",
+    "cooldownHours": 24,
+    "chain": "zenith"
+  },
+  "contracts": {
+    "zenith": {
+      "token": "0x8A05A15aACf6E1009B0D574e995e954f1373f340",
+      "bridge": "0x5190339F59B88B033389059daf7841f52F0e10b4"
+    },
+    "sepolia": {
+      "token": "0xe57AEA293F0E88806Be9542b05E18E8EFB85ee38",
+      "bridge": "0xD3D9C324B55eC6dF066b11C5002eadEAD0cC354a"
+    }
+  }
+}

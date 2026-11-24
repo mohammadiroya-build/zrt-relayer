@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: roundtrip-relayer
+    runtime: node
+    plan: free
+    region: frankfurt
+    rootDir: relayer
+    buildCommand: npm install --omit=dev
+    startCommand: node src/index.js
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: CONFIG_PATH
+        value: ../config/config.json
+      - key: DATA_DIR
+        value: /tmp/roundtrip-data
+      - key: PUBLIC_URL
+        sync: false
+      - key: ATTESTOR_PRIVATE_KEY
+        sync: false
+      - key: RELAYER_PRIVATE_KEY
+        sync: false
+      - key: TREASURY_PRIVATE_KEY
+        sync: false
+      - key: ZENITH_RPC_URL
+        value: https://rpc.testnet.zenith.network/
+      - key: SEPOLIA_RPC_URL
+        sync: false
