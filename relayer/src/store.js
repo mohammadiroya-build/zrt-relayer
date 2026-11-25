@@ -95,12 +95,19 @@ class Store {
     this.dirty = true;
   }
 
-  issueNonce(address) {
-    const nonce = require("crypto").randomBytes(16).toString("hex");
-    this.state.faucet.nonces[address.toLowerCase()] = nonce;
+  /** Reuses a still-fresh nonce so polling status twice cannot invalidate the first message. */
+  issueNonce(address, ttlMs = 10 * 60 * 1000) {
+    const key = address.toLowerCase();
+    const existing = this.state.faucet.nonces[key];
+    const now = Date.now();
+    if (existing && typeof existing === "object" && now - Number(existing.issuedAt) < ttlMs) {
+      return existing;
+    }
+    const record = { nonce: require("crypto").randomBytes(16).toString("hex"), issuedAt: now };
+    this.state.faucet.nonces[key] = record;
     this.dirty = true;
     this.save();
-    return nonce;
+    return record;
   }
 
   peekNonce(address) {

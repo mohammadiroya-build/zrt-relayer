@@ -15,7 +15,7 @@ const store = new Store(config.dataDir);
 const relayer = new Relayer(config, store);
 relayer.init();
 
-const faucet = new Faucet(config, store, relayer.providers, console.log);
+const faucet = new Faucet(config, store, relayer.providers, console.log, (key, fn) => relayer.run(key, fn));
 const app = express();
 app.disable("x-powered-by");
 app.use(cors({ origin: config.cors }));
@@ -39,8 +39,14 @@ app.get("/", (req, res) => {
 
 app.get("/live", (req, res) => res.json({ ok: true }));
 app.get("/health", (req, res) => {
-  const { lastError, ...health } = relayer.health();
-  res.status(health.ok ? 200 : 503).json({ ...health, degraded: !!lastError, uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000) });
+  const health = relayer.health();
+  // "ready" means the configured route is wired and usable; transient indexer
+  // errors surface as "degraded" without taking the whole route offline.
+  res.status(health.ready ? 200 : 503).json({
+    ...health,
+    degraded: !health.ok,
+    uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
+  });
 });
 
 // Bound traffic to the RPC and disk-backed write paths, even if clients rotate addresses.

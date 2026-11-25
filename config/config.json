@@ -58,7 +58,7 @@
     "attestorAddress": "0x49fefA24b766952c8E9a135E74fCF5226B9A0FF8"
   },
   "faucet": {
-    "enabled": false,
+    "enabled": true,
     "amount": "1",
     "cooldownHours": 24,
     "chain": "zenith"

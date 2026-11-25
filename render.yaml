@@ -29,4 +29,12 @@ services:
       - key: SEPOLIA_RPC_URL
         sync: false
       - key: FAUCET_ENABLED
-        value: "false"
+        value: "true"
+      - key: FAUCET_COOLDOWN_HOURS
+        value: "24"
+      - key: FAUCET_AMOUNT
+        value: "1"
+      - key: FAUCET_MINT_FALLBACK
+        value: "true"
+      - key: LOOKBACK_BLOCKS
+        value: "20000"

@@ -20,8 +20,11 @@ class Relayer {
     this.log = (msg) => log(`[relayer ${now()}] ${msg}`);
     this.providers = {};
     this.bridges = {};
+    this.queues = {};
+    this.gas = {};
     this.lock = false;
     this.ready = false;
+    this.minGas = ethers.parseEther(String(config.minGasNative || "0.0005"));
     this.stats = { lastTickAt: null, lastError: null, relayed: 0, refunded: 0, running: false, startedAt: new Date().toISOString() };
   }
 
@@ -39,6 +42,7 @@ class Relayer {
     for (const key of Object.keys(this.config.chains)) {
       const wallet = new ethers.Wallet(this.config.keys.relayer, this.providers[key]);
       this.relayerWallets[key] = wallet;
+      this.queues[key] = Promise.resolve();
     }
     this.relayerAddress = new ethers.Wallet(this.config.keys.relayer).address;
     this.log(`attestor ${this.attestorWallet.address}`);
@@ -65,6 +69,41 @@ class Relayer {
     this.log(`tick error: ${this.stats.lastError}`);
   }
 
+  /** Serializes transactions per chain so the relayer and the faucet can share a key. */
+  run(chainKey, fn) {
+    const previous = this.queues[chainKey] || Promise.resolve();
+    const next = previous.then(fn, fn);
+    this.queues[chainKey] = next.then(() => undefined, () => undefined);
+    return next;
+  }
+
+  isFunded(chainKey) {
+    const entry = this.gas[chainKey];
+    return !entry || entry.funded !== false;
+  }
+
+  async refreshGas() {
+    if (!this.relayerAddress) return;
+    const entries = await Promise.all(
+      Object.keys(this.config.chains).map(async (key) => {
+        try {
+          const balance = await this.providers[key].getBalance(this.relayerAddress);
+          return [key, { balance: ethers.formatEther(balance), funded: balance >= this.minGas }];
+        } catch {
+          return [key, { balance: null, funded: null }];
+        }
+      })
+    );
+    this.gas = Object.fromEntries(entries);
+  }
+
+  fundingError(chainKey) {
+    const chain = this.config.chains[chainKey];
+    const entry = this.gas[chainKey] || {};
+    const balance = entry.balance !== null && entry.balance !== undefined ? `${entry.balance} ${chain.nativeSymbol}` : "no balance";
+    return `relayer wallet needs ${chain.nativeSymbol} for gas on ${chain.name} (holds ${balance})`;
+  }
+
   async tick() {
     if (this.lock) return;
     this.lock = true;
@@ -73,6 +112,7 @@ class Relayer {
       if (!this.config.bridgeEnabled) throw new Error("Bridge disabled in runtime config");
       await this.checkRoute();
       this.ready = true;
+      await this.refreshGas().catch(() => {});
       for (const key of Object.keys(this.config.chains)) {
         await this.scanChain(key).catch((err) => {
           this.stats.lastError = `${key} scan: ${err.shortMessage || err.message}`;
@@ -117,16 +157,25 @@ class Relayer {
     const bridge = this.bridges[key];
     const latest = (await provider.getBlockNumber()) - chain.confirmations + 1;
     const cursor = this.store.getCursor(key);
-    let from = cursor !== null ? cursor + 1 : chain.startBlock ?? Math.max(0, latest - this.config.startBlockOffset);
+    const lookback = Number(this.config.lookbackBlocks || 20000);
+    // The store lives on an ephemeral disk, so a cold start rescans a bounded
+    // window instead of trusting a cursor that may have moved much further.
+    const floor = Math.max(chain.startBlock || 0, latest - lookback);
+    let from = Math.max(cursor !== null ? cursor + 1 : 0, floor);
     if (from > latest) return;
 
-    const span = 500;
-    for (let pages = 0; pages < 10 && from <= latest; pages += 1) {
+    let span = 800;
+    for (let pages = 0; pages < 40 && from <= latest; pages += 1) {
       const to = Math.min(from + span - 1, latest);
       let events = [];
       try {
         events = await bridge.queryFilter(bridge.filters.PacketSent(), from, to);
       } catch (err) {
+        if (span > 200) {
+          span = 200;
+          pages -= 1;
+          continue;
+        }
         throw new Error(`log query ${from}-${to} failed; cursor not advanced (${err.shortMessage || err.code || "RPC error"})`);
       }
       for (const event of events) {
@@ -246,9 +295,14 @@ class Relayer {
     const pending = this.store.pendingTransfers().sort((a, b) => a.updatedAt.localeCompare(b.updatedAt)).slice(0, 32);
     for (const transfer of pending) {
       await this.processTransfer(transfer).catch((err) => {
-        this.stats.lastError = err.shortMessage || err.message;
-        this.log(`${transfer.id}: ${this.stats.lastError}`);
-        this.store.upsertTransfer(transfer.id, { error: "relay attempt deferred; monitoring will retry" });
+        const reason = err.shortMessage || err.reason || err.message || String(err);
+        this.stats.lastError = reason;
+        this.log(`${transfer.id}: ${reason}`);
+        const current = this.store.getTransfer(transfer.id) || transfer;
+        this.store.upsertTransfer(transfer.id, {
+          error: reason.length > 180 ? `${reason.slice(0, 180)}…` : reason,
+          attempts: Number(current.attempts || 0) + 1,
+        });
       });
     }
   }
@@ -264,6 +318,9 @@ class Relayer {
     const dstBridge = this.bridges[state.dstChain];
     const srcBridge = this.bridges[state.srcChain];
     const packet = this.normalizePacket(state.packet);
+
+    if (!this.isFunded(state.srcChain)) throw new Error(this.fundingError(state.srcChain));
+    if (!this.isFunded(state.dstChain)) throw new Error(this.fundingError(state.dstChain));
 
     const confirmed = async (key, chain) => {
       const provider = this.providers[key];
@@ -309,17 +366,27 @@ class Relayer {
     if (!begun) {
       // Do not reserve a packet that already fails destination simulation.
       await sender.receivePacket.staticCall(packet, [signature]);
-      const tx = await srcBridge.connect(this.relayerWallets[state.srcChain]).beginDelivery(state.packetId);
-      await this.wait(tx, src.confirmations);
+      const tx = await this.run(state.srcChain, async () => {
+        const sent = await srcBridge.connect(this.relayerWallets[state.srcChain]).beginDelivery(state.packetId);
+        await this.wait(sent, src.confirmations);
+        return sent;
+      });
+      this.store.upsertTransfer(state.id, { txs: { begin: tx.hash }, error: null });
     }
     if (dstBlock.timestamp > packet.timeout) {
-      const tx = await sender.cancelPacket(packet, [signature]);
-      await this.wait(tx, dst.confirmations);
+      const tx = await this.run(state.dstChain, async () => {
+        const sent = await sender.cancelPacket(packet, [signature]);
+        await this.wait(sent, dst.confirmations);
+        return sent;
+      });
       this.store.upsertTransfer(state.id, { txs: { cancel: tx.hash }, error: null });
       return;
     }
-    const tx = await sender.receivePacket(packet, [signature]);
-    await this.wait(tx, dst.confirmations);
+    const tx = await this.run(state.dstChain, async () => {
+      const sent = await sender.receivePacket(packet, [signature]);
+      await this.wait(sent, dst.confirmations);
+      return sent;
+    });
     this.store.upsertTransfer(state.id, { status: STATUS.RECEIVED, error: null, receivedAt: new Date().toISOString(), txs: { receive: tx.hash } });
     this.store.save();
     this.stats.relayed += 1;
@@ -352,13 +419,17 @@ class Relayer {
     const srcBridge = this.bridges[state.srcChain];
     try {
       this.log(`${state.id}: ack submitting on ${state.srcChain}`);
-      const tx = await srcBridge
-        .connect(this.relayerWallets[state.srcChain])
-        .acknowledge(state.packetId, success, reason, { gasLimit: 300000 });
-      await this.wait(tx, this.config.chains[state.srcChain].confirmations);
+      const tx = await this.run(state.srcChain, async () => {
+        const sent = await srcBridge
+          .connect(this.relayerWallets[state.srcChain])
+          .acknowledge(state.packetId, success, reason, { gasLimit: 300000 });
+        await this.wait(sent, this.config.chains[state.srcChain].confirmations);
+        return sent;
+      });
       this.store.upsertTransfer(state.id, {
         status: success ? STATUS.ACKNOWLEDGED : STATUS.FAILED,
         acknowledgedAt: new Date().toISOString(),
+        error: null,
         txs: { ack: tx.hash },
       });
       this.store.save();
@@ -376,11 +447,15 @@ class Relayer {
     const srcBridge = this.bridges[state.srcChain];
     try {
       await srcBridge.refund.staticCall(state.packetId);
-      const tx = await srcBridge.connect(this.relayerWallets[state.srcChain]).refund(state.packetId, { gasLimit: 300000 });
-      await this.wait(tx, this.config.chains[state.srcChain].confirmations);
+      const tx = await this.run(state.srcChain, async () => {
+        const sent = await srcBridge.connect(this.relayerWallets[state.srcChain]).refund(state.packetId, { gasLimit: 300000 });
+        await this.wait(sent, this.config.chains[state.srcChain].confirmations);
+        return sent;
+      });
       this.store.upsertTransfer(state.id, {
         status: STATUS.REFUNDED,
         refundedAt: new Date().toISOString(),
+        error: null,
         txs: { refund: tx.hash },
       });
       this.store.save();
@@ -393,9 +468,14 @@ class Relayer {
   }
 
   health() {
+    const fresh = !!this.stats.lastTickAt &&
+      Date.now() - Date.parse(this.stats.lastTickAt) < Math.max(180000, this.config.pollMs * 3);
+    const funded = Object.fromEntries(
+      Object.entries(this.config.chains).map(([key]) => [key, this.isFunded(key)])
+    );
     return {
-      ok: this.ready && !this.stats.lastError && !!this.stats.lastTickAt &&
-        Date.now() - Date.parse(this.stats.lastTickAt) < Math.max(180000, this.config.pollMs * 3),
+      ok: this.ready && !this.stats.lastError && fresh,
+      ready: this.ready,
       protocolVersion: 2,
       relayerAddress: this.relayerAddress || null,
       attestorAddress: this.attestorWallet?.address || null,
@@ -407,10 +487,12 @@ class Relayer {
       relayed: this.stats.relayed,
       refunded: this.stats.refunded,
       pending: this.store.pendingTransfers().length,
+      funded,
+      gas: this.gas,
       chains: Object.fromEntries(
         Object.entries(this.config.chains).map(([key, chain]) => [
           key,
-          { chainId: chain.chainId, bridge: chain.bridge, cursor: this.store.getCursor(key) },
+          { chainId: chain.chainId, bridge: chain.bridge, token: chain.token?.address || chain.token, cursor: this.store.getCursor(key) },
         ])
       ),
     };
