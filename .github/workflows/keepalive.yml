@@ -1,0 +1,36 @@
+name: Relayer readiness monitor
+
+# Keeps the free instance from idling out between requests. GitHub schedules can be
+# delayed, so treat this as a warm-up rather than an uptime guarantee.
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Verify protocol readiness
+        env:
+          RELAYER_URL: https://roundtrip-relayer.onrender.com
+        run: |
+          case "$RELAYER_URL" in https://*) ;; *) echo "HTTPS RELAYER_URL required"; exit 1;; esac
+          url="${RELAYER_URL%/}/live"
+          for attempt in 1 2 3 4 5; do
+            code=$(curl -s -o /tmp/health.json -w "%{http_code}" --max-time 30 "$url" || true)
+            echo "attempt $attempt → HTTP $code"
+            if [ "$code" = "200" ]; then
+              exit 0
+            fi
+            # A cold start can take up to a minute; keep the request open.
+            sleep 20
+          done
+          echo "relayer did not answer"; exit 1
