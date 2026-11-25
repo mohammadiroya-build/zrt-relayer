@@ -12,10 +12,13 @@ class Faucet {
     this.chainKey = config.faucet.chain;
     this.chain = config.chains[this.chainKey];
     this.wallet = config.keys.treasury ? new ethers.Wallet(config.keys.treasury, this.providers[this.chainKey]) : null;
+    if (this.wallet && config.keys.relayer && this.wallet.address === new ethers.Wallet(config.keys.relayer).address) {
+      throw new Error("Treasury and transaction relayer must use different wallets");
+    }
     this.token = this.wallet
       ? new ethers.Contract(this.chain.token.address, tokenAbi, this.wallet)
       : null;
-    this.inflight = new Set();
+    this.inflight = false;
   }
 
   message({ address, nonce, issued }) {
@@ -33,7 +36,7 @@ class Faucet {
     const last = this.store.lastClaim(normalized);
     const cooldownMs = this.config.faucet.cooldownHours * 3600 * 1000;
     const nextAt = last ? new Date(new Date(last.at).getTime() + cooldownMs) : null;
-    const eligible = this.config.faucet.enabled && (!nextAt || nextAt <= new Date());
+    const eligible = this.config.faucet.enabled && !!this.token && (!nextAt || nextAt <= new Date());
     const nonce = this.config.faucet.enabled && eligible ? this.store.issueNonce(normalized) : null;
     const issued = new Date().toISOString();
 
@@ -81,21 +84,21 @@ class Faucet {
     }
     if (recovered !== normalized) throw httpError(403, "signature does not match the wallet");
 
-    const state = await this.status(normalized);
-    if (!state.eligible) throw httpError(429, `faucet cooldown active until ${state.nextEligibleAt}`);
-    if (this.inflight.has(normalized)) throw httpError(429, "claim already in progress");
-
-    const balance = await this.token.balanceOf(this.wallet.address);
-    const amount = ethers.parseUnits(this.config.faucet.amount, this.config.decimals);
-    if (balance < amount) throw httpError(503, "treasury is empty");
-
-    this.inflight.add(normalized);
+    if (this.inflight) throw httpError(429, "another claim is in progress; try again shortly");
+    this.inflight = true;
     try {
+      const last = this.store.lastClaim(normalized);
+      if (last && Date.now() - Date.parse(last.at) < this.config.faucet.cooldownHours * 3600000) {
+        throw httpError(429, "faucet cooldown active");
+      }
+      const balance = await this.token.balanceOf(this.wallet.address);
+      const amount = ethers.parseUnits(this.config.faucet.amount, this.config.decimals);
+      if (balance < amount) throw httpError(503, "treasury is empty");
       this.store.consumeNonce(normalized);
       this.store.save();
 
       const tx = await this.token.transfer(normalized, amount, { gasLimit: 120000 });
-      const receipt = await tx.wait(this.chain.confirmations);
+      const receipt = await tx.wait(this.chain.confirmations, 90000);
       if (!receipt || receipt.status !== 1) throw new Error("transfer reverted");
 
       this.store.recordClaim(normalized, {
@@ -117,7 +120,7 @@ class Faucet {
         nextEligibleAt: new Date(Date.now() + this.config.faucet.cooldownHours * 3600 * 1000).toISOString(),
       };
     } finally {
-      this.inflight.delete(normalized);
+      this.inflight = false;
     }
   }
 }

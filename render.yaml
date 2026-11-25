@@ -7,11 +7,11 @@ services:
     rootDir: relayer
     buildCommand: npm install --omit=dev
     startCommand: node src/index.js
-    healthCheckPath: /health
+    healthCheckPath: /live
     autoDeploy: true
     envVars:
       - key: NODE_VERSION
-        value: "20"
+        value: "22"
       - key: CONFIG_PATH
         value: ../config/config.json
       - key: DATA_DIR
@@ -28,3 +28,5 @@ services:
         value: https://rpc.testnet.zenith.network/
       - key: SEPOLIA_RPC_URL
         sync: false
+      - key: FAUCET_ENABLED
+        value: "false"

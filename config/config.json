@@ -1,7 +1,8 @@
 {
-  "version": 1,
+  "version": 2,
+  "bridgeEnabled": true,
   "network": "testnet",
-  "generatedAt": "2026-11-24T14:14:17.100Z",
+  "deployer": "0x7a5d72d2B9aA5345802511c4C49EEc8E86826192",
   "route": {
     "tokenId": "0xd29350d118a457eb3698b6aeb455806ad90be0d933b94cf9499bfd817d11b7dc",
     "symbol": "ZRT",
@@ -18,13 +19,14 @@
       "explorer": "https://explorer.testnet.zenith.network",
       "nativeSymbol": "ZTH",
       "nativeName": "Zenith gas token",
-      "confirmations": 1,
+      "confirmations": 3,
+      "startBlock": 339104,
       "token": {
-        "address": "0x8A05A15aACf6E1009B0D574e995e954f1373f340",
+        "address": "0xC26a2E1CD2a53ca37C740e92D8e35b51241f5cD3",
         "symbol": "ZRT",
         "decimals": 18
       },
-      "bridge": "0x5190339F59B88B033389059daf7841f52F0e10b4"
+      "bridge": "0x69c4F4D9C8c184d46aA00E82F77895367E7EbE2f"
     },
     "sepolia": {
       "key": "sepolia",
@@ -35,13 +37,14 @@
       "explorer": "https://sepolia.etherscan.io",
       "nativeSymbol": "ETH",
       "nativeName": "Sepolia ether",
-      "confirmations": 1,
+      "confirmations": 3,
+      "startBlock": 12205276,
       "token": {
-        "address": "0xe57AEA293F0E88806Be9542b05E18E8EFB85ee38",
+        "address": "0x42BC88Bad322C840D9fd4ED685Cd0715Ffdc57Bc",
         "symbol": "ZRT",
         "decimals": 18
       },
-      "bridge": "0xD3D9C324B55eC6dF066b11C5002eadEAD0cC354a"
+      "bridge": "0xEEad5268C198bd23E35e7f7b74C6c2c0ce7e6d68"
     }
   },
   "defaultRoute": {
@@ -49,23 +52,25 @@
     "to": "sepolia"
   },
   "relayer": {
-    "url": "",
-    "healthPath": "/health"
+    "url": "https://roundtrip-relayer.onrender.com",
+    "healthPath": "/health",
+    "address": "0x93055f8880322904687466A7C020A2fD266DD815",
+    "attestorAddress": "0x49fefA24b766952c8E9a135E74fCF5226B9A0FF8"
   },
   "faucet": {
-    "enabled": true,
+    "enabled": false,
     "amount": "1",
     "cooldownHours": 24,
     "chain": "zenith"
   },
   "contracts": {
     "zenith": {
-      "token": "0x8A05A15aACf6E1009B0D574e995e954f1373f340",
-      "bridge": "0x5190339F59B88B033389059daf7841f52F0e10b4"
+      "token": "0xC26a2E1CD2a53ca37C740e92D8e35b51241f5cD3",
+      "bridge": "0x69c4F4D9C8c184d46aA00E82F77895367E7EbE2f"
     },
     "sepolia": {
-      "token": "0xe57AEA293F0E88806Be9542b05E18E8EFB85ee38",
-      "bridge": "0xD3D9C324B55eC6dF066b11C5002eadEAD0cC354a"
+      "token": "0x42BC88Bad322C840D9fd4ED685Cd0715Ffdc57Bc",
+      "bridge": "0xEEad5268C198bd23E35e7f7b74C6c2c0ce7e6d68"
     }
   }
 }

@@ -17,7 +17,7 @@ relayer.init();
 
 const faucet = new Faucet(config, store, relayer.providers, console.log);
 const app = express();
-app.set("trust proxy", true);
+app.disable("x-powered-by");
 app.use(cors({ origin: config.cors }));
 app.use(express.json({ limit: "64kb" }));
 
@@ -28,7 +28,7 @@ function asyncRoute(handler) {
     Promise.resolve(handler(req, res)).catch((err) => {
       const status = err.status || 500;
       if (status >= 500) console.error(err);
-      res.status(status).json({ error: err.message || "internal error" });
+      res.status(status).json({ error: status >= 500 ? "service unavailable" : err.message });
     });
   };
 }
@@ -37,7 +37,22 @@ app.get("/", (req, res) => {
   res.json({ service: "roundtrip-relayer", status: "ok", endpoints: ["/health", "/api/transfers", "/api/relay", "/api/faucet/status", "/api/faucet/claim"] });
 });
 
-app.get("/health", (req, res) => res.json({ ...relayer.health(), uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000) }));
+app.get("/live", (req, res) => res.json({ ok: true }));
+app.get("/health", (req, res) => {
+  const { lastError, ...health } = relayer.health();
+  res.status(health.ok ? 200 : 503).json({ ...health, degraded: !!lastError, uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000) });
+});
+
+// Bound traffic to the RPC and disk-backed write paths, even if clients rotate addresses.
+function budget(max) {
+  let reset = 0;
+  let used = 0;
+  return (req, res, next) => {
+    if (Date.now() >= reset) { reset = Date.now() + 60000; used = 0; }
+    if (++used > max) return res.set("Retry-After", "60").status(429).json({ error: "try again shortly" });
+    next();
+  };
+}
 app.get("/api/health", (req, res) => res.redirect(307, "/health"));
 
 app.get(
@@ -76,6 +91,7 @@ app.get(
 
 app.post(
   "/api/relay",
+  budget(120),
   asyncRoute(async (req, res) => {
     const { chainId, txHash } = req.body || {};
     if (!txHash || !/^0x[0-9a-fA-F]{64}$/.test(txHash)) throw Object.assign(new Error("valid txHash required"), { status: 400 });
@@ -90,6 +106,7 @@ app.post(
 
 app.get(
   "/api/faucet/status",
+  budget(120),
   asyncRoute(async (req, res) => {
     const { address } = req.query;
     if (!address || !ethers.isAddress(address)) throw Object.assign(new Error("valid address required"), { status: 400 });
@@ -99,6 +116,7 @@ app.get(
 
 app.post(
   "/api/faucet/claim",
+  budget(30),
   asyncRoute(async (req, res) => {
     const { address, signature, nonce, issued } = req.body || {};
     const result = await faucet.claim({ address, signature, nonce, issued });

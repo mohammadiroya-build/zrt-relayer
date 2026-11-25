@@ -27,6 +27,7 @@ function findConfigFile() {
     process.env.CONFIG_PATH,
     path.resolve(process.cwd(), "config/config.json"),
     path.resolve(__dirname, "../../config/config.json"),
+    path.resolve(__dirname, "../../web/config.json"),
     path.resolve(__dirname, "../config.json"),
   ].filter(Boolean);
   for (const file of candidates) {
@@ -46,18 +47,22 @@ for (const [key, chain] of Object.entries(app.chains)) {
     confirmations: Number(process.env.CONFIRMATIONS || chain.confirmations || 1),
   };
 }
+if (Object.keys(chains).length !== 2 || Object.values(chains).some((c) =>
+  !Number.isSafeInteger(c.confirmations) || c.confirmations < 1)) {
+  throw new Error("Exactly two chains with positive confirmation counts are required");
+}
 
 const port = Number(process.env.PORT || 8787);
-const publicUrl = (process.env.PUBLIC_URL || process.env.RELAYER_PUBLIC_URL || `http://localhost:${port}`).replace(/\/$/, "");
 
 module.exports = {
   port,
-  publicUrl,
   configFile,
+  bridgeEnabled: app.version === 2 && app.bridgeEnabled === true,
   tokenId: app.route.tokenId,
   symbol: app.route.symbol,
   decimals: app.route.decimals,
   chains,
+  expectedRoles: { attestor: app.relayer && app.relayer.attestorAddress, relayer: app.relayer && app.relayer.address },
   defaultRoute: app.defaultRoute,
   faucet: {
     enabled: process.env.FAUCET_ENABLED !== "false" && app.faucet.enabled !== false,
@@ -72,7 +77,6 @@ module.exports = {
   },
   pollMs: Number(process.env.POLL_MS || 30000),
   startBlockOffset: Number(process.env.START_BLOCK_OFFSET || 5000),
-  maxRetries: Number(process.env.MAX_RETRIES || 5),
   dataDir: process.env.DATA_DIR || path.resolve(__dirname, "../data"),
   cors: process.env.CORS_ORIGIN || "*",
 };

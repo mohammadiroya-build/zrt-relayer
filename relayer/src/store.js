@@ -76,7 +76,7 @@ class Store {
 
   // cursors -------------------------------------------------------------
   getCursor(chain) {
-    return this.state.cursors[chain] || 0;
+    return this.state.cursors[chain] ?? null;
   }
 
   setCursor(chain, block) {

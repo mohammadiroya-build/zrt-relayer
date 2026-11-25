@@ -21,24 +21,35 @@ class Relayer {
     this.providers = {};
     this.bridges = {};
     this.lock = false;
+    this.ready = false;
     this.stats = { lastTickAt: null, lastError: null, relayed: 0, refunded: 0, running: false, startedAt: new Date().toISOString() };
   }
 
   init() {
     for (const [key, chain] of Object.entries(this.config.chains)) {
-      const provider = new ethers.JsonRpcProvider(chain.rpcUrl, chain.chainId, { staticNetwork: true });
+      const request = new ethers.FetchRequest(chain.rpcUrl);
+      request.timeout = 12000;
+      const provider = new ethers.JsonRpcProvider(request, chain.chainId, { staticNetwork: true });
       this.providers[key] = provider;
       this.bridges[key] = new ethers.Contract(chain.bridge, bridgeAbi, provider);
     }
+    if (!this.config.keys.attestor || !this.config.keys.relayer) return;
     this.attestorWallet = new ethers.Wallet(this.config.keys.attestor);
     this.relayerWallets = {};
     for (const key of Object.keys(this.config.chains)) {
       const wallet = new ethers.Wallet(this.config.keys.relayer, this.providers[key]);
-      this.relayerWallets[key] = new ethers.NonceManager(wallet);
+      this.relayerWallets[key] = wallet;
     }
     this.relayerAddress = new ethers.Wallet(this.config.keys.relayer).address;
     this.log(`attestor ${this.attestorWallet.address}`);
     this.log(`relayer  ${this.relayerAddress}`);
+    const cfg = this.config.expectedRoles || {};
+    if (cfg.attestor && cfg.attestor.toLowerCase() !== this.attestorWallet.address.toLowerCase()) {
+      this.log(`WARNING: ATTESTOR_PRIVATE_KEY gives ${this.attestorWallet.address} but config expects ${cfg.attestor}`);
+    }
+    if (cfg.relayer && cfg.relayer.toLowerCase() !== this.relayerAddress.toLowerCase()) {
+      this.log(`WARNING: RELAYER_PRIVATE_KEY gives ${this.relayerAddress} but config expects ${cfg.relayer}`);
+    }
   }
 
   start() {
@@ -47,7 +58,6 @@ class Relayer {
     this.log("indexer started");
     this.tick().catch((err) => this.fail(err));
     this.timer = setInterval(() => this.tick().catch((err) => this.fail(err)), this.config.pollMs);
-    this.keepAlive();
   }
 
   fail(err) {
@@ -55,25 +65,14 @@ class Relayer {
     this.log(`tick error: ${this.stats.lastError}`);
   }
 
-  /** Keeps hosts that idle-sleep on a schedule from doing so. */
-  keepAlive() {
-    if (!/^https:\/\//.test(this.config.publicUrl)) return;
-    const ping = async () => {
-      try {
-        const res = await fetch(`${this.config.publicUrl}/health`);
-        this.log(`keepalive ${res.status}`);
-      } catch {
-        /* host unreachable; the workflow ping is the backup */
-      }
-    };
-    ping();
-    setInterval(ping, 10 * 60 * 1000);
-  }
-
   async tick() {
     if (this.lock) return;
     this.lock = true;
     try {
+      this.stats.lastError = null;
+      if (!this.config.bridgeEnabled) throw new Error("Bridge disabled in runtime config");
+      await this.checkRoute();
+      this.ready = true;
       for (const key of Object.keys(this.config.chains)) {
         await this.scanChain(key).catch((err) => {
           this.stats.lastError = `${key} scan: ${err.shortMessage || err.message}`;
@@ -82,9 +81,30 @@ class Relayer {
       await this.processPending();
       this.store.save();
       this.stats.lastTickAt = new Date().toISOString();
+    } catch (err) {
+      this.ready = false;
+      throw err;
     } finally {
       this.lock = false;
     }
+  }
+
+  async checkRoute() {
+    await Promise.all(Object.entries(this.config.chains).map(async ([key, chain]) => {
+      const bridge = this.bridges[key];
+      const peer = Object.entries(this.config.chains).find(([other]) => other !== key)[1];
+      const [network, version, relayer, attestor, threshold, count, peerAddress, token] = await Promise.all([
+        this.providers[key].send("eth_chainId", []), bridge.protocolVersion(), bridge.relayer(),
+        bridge.isAttestor(this.attestorWallet.address), bridge.threshold(), bridge.attestorCount(), bridge.peers(peer.domain),
+        bridge.tokens(this.config.tokenId),
+      ]);
+      if (Number(network) !== Number(chain.chainId) || version !== 2n ||
+          !attestor || threshold !== 1n || count !== 1n || relayer.toLowerCase() !== this.relayerAddress.toLowerCase() ||
+          peerAddress.toLowerCase() !== peer.bridge.toLowerCase() ||
+          token.toLowerCase() !== (chain.token.address || chain.token).toLowerCase()) {
+        throw new Error(`${key}: bridge wiring does not match configured keys and route`);
+      }
+    }));
   }
 
   // ---------------------------------------------------------------------
@@ -95,23 +115,19 @@ class Relayer {
     const chain = this.config.chains[key];
     const provider = this.providers[key];
     const bridge = this.bridges[key];
-    const latest = await provider.getBlockNumber();
+    const latest = (await provider.getBlockNumber()) - chain.confirmations + 1;
     const cursor = this.store.getCursor(key);
-    let from = cursor ? cursor + 1 : Math.max(0, latest - this.config.startBlockOffset);
+    let from = cursor !== null ? cursor + 1 : chain.startBlock ?? Math.max(0, latest - this.config.startBlockOffset);
     if (from > latest) return;
 
-    const span = 2000;
-    while (from <= latest) {
+    const span = 500;
+    for (let pages = 0; pages < 10 && from <= latest; pages += 1) {
       const to = Math.min(from + span - 1, latest);
       let events = [];
       try {
         events = await bridge.queryFilter(bridge.filters.PacketSent(), from, to);
       } catch (err) {
-        // Public RPCs sometimes cap log ranges. Move forward; the manual
-        // relay endpoint still accepts a transaction hash for any packet.
-        this.log(`${key}: log query ${from}-${to} failed (${err.shortMessage || err.code}); skipping window`);
-        from = to + 1;
-        continue;
+        throw new Error(`log query ${from}-${to} failed; cursor not advanced (${err.shortMessage || err.code || "RPC error"})`);
       }
       for (const event of events) {
         const packet = {
@@ -127,7 +143,7 @@ class Relayer {
           sequence: Number(event.args.sequence),
         };
         const dstKey = this.keyForDomain(packet.dstDomain);
-        if (!dstKey) continue;
+        if (!dstKey || dstKey === key || packet.tokenId !== this.config.tokenId) continue;
         const id = this.store.transferId(key, packet.id);
         if (this.store.getTransfer(id)) continue;
         const transfer = this.store.upsertTransfer(id, {
@@ -163,13 +179,17 @@ class Relayer {
   }
 
   async enqueueFromTx(chainKey, txHash) {
+    const reject = (message, status = 400) => Object.assign(new Error(message), { status });
+    if (!this.ready) throw reject("route not ready", 503);
     const chain = this.config.chains[chainKey];
     if (!chain) throw new Error(`unknown chain ${chainKey}`);
     const bridge = this.bridges[chainKey];
     const receipt = await this.providers[chainKey].getTransactionReceipt(txHash);
-    if (!receipt) throw new Error("transaction not found or not mined yet");
+    if (!receipt || receipt.status !== 1) throw reject("confirmed successful transaction required", 404);
+    if (await receipt.confirmations() < chain.confirmations) throw reject("waiting for source confirmations", 409);
 
     const parsed = receipt.logs
+      .filter((log) => log.address.toLowerCase() === chain.bridge.toLowerCase())
       .map((log) => {
         try {
           return bridge.interface.parseLog(log);
@@ -179,13 +199,13 @@ class Relayer {
       })
       .filter((log) => log && log.name === "PacketSent");
 
-    if (!parsed.length) throw new Error("no PacketSent event in this transaction");
+    if (!parsed.length) throw reject("no PacketSent event from the configured source bridge");
     const event = parsed[0];
     const packet = {
       id: event.args.packetId,
       srcDomain: chain.domain,
       dstDomain: Number(event.args.dstDomain),
-      srcBridge: receipt.to,
+      srcBridge: chain.bridge,
       sender: event.args.sender,
       recipient: event.args.recipient,
       tokenId: event.args.tokenId,
@@ -194,7 +214,10 @@ class Relayer {
       sequence: Number(event.args.sequence),
     };
     const dstKey = this.keyForDomain(packet.dstDomain);
+    if (!dstKey || dstKey === chainKey || packet.tokenId !== this.config.tokenId) throw reject("unsupported packet route");
     const id = this.store.transferId(chainKey, packet.id);
+    const existing = this.store.getTransfer(id);
+    if (existing) return existing;
     const transfer = this.store.upsertTransfer(id, {
       packetId: packet.id,
       srcChain: chainKey,
@@ -212,8 +235,7 @@ class Relayer {
       packet,
     });
     this.store.save(true);
-    await this.processTransfer(transfer, true);
-    return this.store.getTransfer(id);
+    return transfer;
   }
 
   // ---------------------------------------------------------------------
@@ -221,16 +243,17 @@ class Relayer {
   // ---------------------------------------------------------------------
 
   async processPending() {
-    const pending = this.store.pendingTransfers();
+    const pending = this.store.pendingTransfers().sort((a, b) => a.updatedAt.localeCompare(b.updatedAt)).slice(0, 32);
     for (const transfer of pending) {
       await this.processTransfer(transfer).catch((err) => {
         this.stats.lastError = err.shortMessage || err.message;
         this.log(`${transfer.id}: ${this.stats.lastError}`);
+        this.store.upsertTransfer(transfer.id, { error: "relay attempt deferred; monitoring will retry" });
       });
     }
   }
 
-  async processTransfer(transfer, immediate = false) {
+  async processTransfer(transfer) {
     const state = this.store.getTransfer(transfer.id);
     if (!state) return;
     if ([STATUS.ACKNOWLEDGED, STATUS.REFUNDED].includes(state.status)) return;
@@ -242,66 +265,71 @@ class Relayer {
     const srcBridge = this.bridges[state.srcChain];
     const packet = this.normalizePacket(state.packet);
 
-    // Destination already credited (for example after a crash): finish the ack.
-    if (state.status === STATUS.RECEIVED) {
-      await this.sendAck(state, true, "0x");
+    const confirmed = async (key, chain) => {
+      const provider = this.providers[key];
+      const height = Number(await provider.send("eth_blockNumber", [])) - chain.confirmations + 1;
+      const block = await provider.getBlock(height);
+      if (!block) throw new Error(`confirmed block unavailable: ${key}`);
+      return block;
+    };
+    const srcBlock = await confirmed(state.srcChain, src);
+    const srcAt = { blockTag: srcBlock.number };
+    const status = await srcBridge.status(state.packetId, srcAt);
+    if (status === 4n || status === 3n) {
+      this.store.upsertTransfer(state.id, { status: status === 4n ? STATUS.REFUNDED : STATUS.ACKNOWLEDGED });
       return;
     }
-
-    if (state.status === STATUS.FAILED) {
-      await this.refund(state);
-      return;
+    if (status !== 1n) throw new Error("source packet not confirmed");
+    const dstBlock = await confirmed(state.dstChain, dst);
+    const dstAt = { blockTag: dstBlock.number };
+    const [begun, delivered, cancelled] = await Promise.all([
+      srcBridge.deliveryStarted(state.packetId, srcAt),
+      dstBridge.processed(state.packetId, dstAt), dstBridge.cancelled(state.packetId, dstAt),
+    ]);
+    if (delivered && !begun) throw new Error("inconsistent source reservation");
+    if (delivered) {
+      this.store.upsertTransfer(state.id, { status: STATUS.RECEIVED, error: null });
+      return this.sendAck(this.store.getTransfer(state.id), true, "0x");
     }
-
-    if (Number(state.timeout) < Math.floor(Date.now() / 1000)) {
-      await this.refund(state);
-      return;
-    }
-
-    try {
-      const processed = await dstBridge.processed(state.packetId);
-      if (processed) {
-        await this.sendAck(state, true, "0x");
-        return;
+    if (cancelled) {
+      if (!begun) throw new Error("inconsistent destination cancellation");
+      if (!(await srcBridge.ackFailed(state.packetId, srcAt))) {
+        await this.sendAck(state, false, ethers.toUtf8Bytes("confirmed destination cancellation"));
       }
-
-      const digest = await dstBridge.attestationDigest(packet);
-      const signature = this.attestorWallet.signingKey.sign(digest).serialized;
-      await dstBridge.receivePacket.staticCall(packet, [signature]);
-
-      const tx = await dstBridge
-        .connect(this.relayerWallets[state.dstChain])
-        .receivePacket(packet, [signature], { gasLimit: 900000 });
-      this.log(`${state.id}: receive submitted ${tx.hash}`);
-      const receipt = await tx.wait(dst.confirmations);
-      if (!receipt || receipt.status !== 1) throw new Error("receive transaction reverted");
-
-      this.store.upsertTransfer(state.id, {
-        status: STATUS.RECEIVED,
-        receivedAt: new Date().toISOString(),
-        txs: { receive: tx.hash },
-      });
-      this.store.save();
-      this.log(`${state.id}: received on ${state.dstChain}`);
-      this.stats.relayed += 1;
-
-      await this.sendAck(this.store.getTransfer(state.id), true, "0x");
-    } catch (err) {
-      const reason = err.shortMessage || err.reason || err.message || "receive failed";
-      const attempts = (state.attempts || 0) + 1;
-      this.store.upsertTransfer(state.id, { attempts, error: reason });
-
-      const fatal = /revert|insufficient|invalid|not allowed|unknown peer|cap/i.test(reason);
-      if (fatal || attempts >= this.config.maxRetries) {
-        this.log(`${state.id}: marking failed (${reason})`);
-        this.store.upsertTransfer(state.id, { status: STATUS.FAILED, error: reason });
-        await this.sendAck(this.store.getTransfer(state.id), false, ethers.toUtf8Bytes(reason.slice(0, 120)));
-        await this.refund(this.store.getTransfer(state.id));
-      } else {
-        this.log(`${state.id}: attempt ${attempts} failed, will retry (${reason})`);
-      }
-      if (immediate) throw err;
+      return this.refund(this.store.getTransfer(state.id));
     }
+    if (!begun && srcBlock.timestamp > packet.timeout) return this.refund(state);
+    if (!begun && dstBlock.timestamp > packet.timeout) {
+      this.store.upsertTransfer(state.id, { error: null });
+      return;
+    }
+    const digest = await dstBridge.attestationDigest(packet);
+    const signature = this.attestorWallet.signingKey.sign(digest).serialized;
+    const sender = dstBridge.connect(this.relayerWallets[state.dstChain]);
+    if (!begun) {
+      // Do not reserve a packet that already fails destination simulation.
+      await sender.receivePacket.staticCall(packet, [signature]);
+      const tx = await srcBridge.connect(this.relayerWallets[state.srcChain]).beginDelivery(state.packetId);
+      await this.wait(tx, src.confirmations);
+    }
+    if (dstBlock.timestamp > packet.timeout) {
+      const tx = await sender.cancelPacket(packet, [signature]);
+      await this.wait(tx, dst.confirmations);
+      this.store.upsertTransfer(state.id, { txs: { cancel: tx.hash }, error: null });
+      return;
+    }
+    const tx = await sender.receivePacket(packet, [signature]);
+    await this.wait(tx, dst.confirmations);
+    this.store.upsertTransfer(state.id, { status: STATUS.RECEIVED, error: null, receivedAt: new Date().toISOString(), txs: { receive: tx.hash } });
+    this.store.save();
+    this.stats.relayed += 1;
+    await this.sendAck(this.store.getTransfer(state.id), true, "0x");
+  }
+
+  async wait(tx, confirmations) {
+    const receipt = await tx.wait(confirmations, 90000);
+    if (!receipt || receipt.status !== 1) throw new Error("transaction not confirmed");
+    return receipt;
   }
 
   normalizePacket(packet) {
@@ -321,15 +349,13 @@ class Relayer {
 
   async sendAck(state, success, reason) {
     if (!state) return;
-    if (state.txs?.ack) return;
     const srcBridge = this.bridges[state.srcChain];
     try {
       this.log(`${state.id}: ack submitting on ${state.srcChain}`);
       const tx = await srcBridge
         .connect(this.relayerWallets[state.srcChain])
         .acknowledge(state.packetId, success, reason, { gasLimit: 300000 });
-      const receipt = await tx.wait(this.config.chains[state.srcChain].confirmations);
-      if (!receipt || receipt.status !== 1) throw new Error("ack transaction reverted");
+      await this.wait(tx, this.config.chains[state.srcChain].confirmations);
       this.store.upsertTransfer(state.id, {
         status: success ? STATUS.ACKNOWLEDGED : STATUS.FAILED,
         acknowledgedAt: new Date().toISOString(),
@@ -351,8 +377,7 @@ class Relayer {
     try {
       await srcBridge.refund.staticCall(state.packetId);
       const tx = await srcBridge.connect(this.relayerWallets[state.srcChain]).refund(state.packetId, { gasLimit: 300000 });
-      const receipt = await tx.wait(this.config.chains[state.srcChain].confirmations);
-      if (!receipt || receipt.status !== 1) throw new Error("refund transaction reverted");
+      await this.wait(tx, this.config.chains[state.srcChain].confirmations);
       this.store.upsertTransfer(state.id, {
         status: STATUS.REFUNDED,
         refundedAt: new Date().toISOString(),
@@ -369,7 +394,11 @@ class Relayer {
 
   health() {
     return {
-      ok: true,
+      ok: this.ready && !this.stats.lastError && !!this.stats.lastTickAt &&
+        Date.now() - Date.parse(this.stats.lastTickAt) < Math.max(180000, this.config.pollMs * 3),
+      protocolVersion: 2,
+      relayerAddress: this.relayerAddress || null,
+      attestorAddress: this.attestorWallet?.address || null,
       service: "roundtrip-relayer",
       uptimeSeconds: Math.floor(process.uptime()),
       startedAt: this.stats.startedAt,
