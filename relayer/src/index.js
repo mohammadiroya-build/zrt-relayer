@@ -40,9 +40,10 @@ app.get("/", (req, res) => {
 app.get("/live", (req, res) => res.json({ ok: true }));
 app.get("/health", (req, res) => {
   const health = relayer.health();
-  // "ready" means the configured route is wired and usable; transient indexer
-  // errors surface as "degraded" without taking the whole route offline.
-  res.status(health.ready ? 200 : 503).json({
+  // "ready" means the configured route is wired and usable. Readiness is reported in
+  // the body only: the platform health check and the UI both need a 200 from a process
+  // that is alive even while the route is unfunded or its indexer is catching up.
+  res.status(200).json({
     ...health,
     degraded: !health.ok,
     uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
